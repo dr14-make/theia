@@ -290,6 +290,8 @@ export class OpenAiResponseApiUtils {
                 });
             } else if (LanguageModelMessage.isThinkingMessage(message)) {
                 // Pass
+            } else if (LanguageModelMessage.isCompactionMessage(message)) {
+                // Pass: provider-specific compaction summaries are not sent, the full history is still available
             } else {
                 unreachable(message);
             }

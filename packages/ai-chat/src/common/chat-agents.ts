@@ -27,6 +27,8 @@ import {
     CapabilityAwareContext,
     GenericCapabilitySelections,
     getTextOfResponse,
+    isCompactionResponsePart,
+    isContextEditResponsePart,
     isLanguageModelStreamResponsePart,
     isTextResponsePart,
     isThinkingResponsePart,
@@ -63,6 +65,8 @@ import {
     ChatRequestModel,
     ChatResponseContent,
     CommonChatSessionSettings,
+    CompactionChatResponseContentImpl,
+    ContextEditChatResponseContentImpl,
     ErrorChatResponseContentImpl,
     MarkdownChatResponseContentImpl,
     MutableChatRequestModel,
@@ -709,6 +713,12 @@ export abstract class AbstractStreamParsingChatAgent extends AbstractChatAgent {
         }
         if (isThinkingResponsePart(token)) {
             return new ThinkingChatResponseContentImpl(token.thought, token.signature);
+        }
+        if (isCompactionResponsePart(token)) {
+            return new CompactionChatResponseContentImpl(token.compaction.summary ?? '');
+        }
+        if (isContextEditResponsePart(token)) {
+            return new ContextEditChatResponseContentImpl(token.context_edits);
         }
         if (isUsageResponsePart(token)) {
             request.response.setTokenUsage(this.mapUsageResponsePart(token));

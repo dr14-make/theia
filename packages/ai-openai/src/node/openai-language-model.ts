@@ -369,7 +369,7 @@ export class OpenAiModelUtils {
         model?: string
     ): ChatCompletionMessageParam[] {
         const processed = this.processSystemMessages(messages, developerMessageSettings);
-        const converted = processed.filter(m => m.type !== 'thinking').map(m => this.toOpenAIMessage(m, developerMessageSettings));
+        const converted = processed.filter(m => m.type !== 'thinking' && m.type !== 'compaction').map(m => this.toOpenAIMessage(m, developerMessageSettings));
         return this.mergeConsecutiveAssistantMessages(converted);
     }
 
