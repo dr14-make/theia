@@ -15,8 +15,8 @@
 // *****************************************************************************
 
 import * as React from '@theia/core/shared/react';
-import { Virtuoso } from '@theia/core/shared/react-virtuoso';
-import { injectable, inject, postConstruct } from '@theia/core/shared/inversify';
+import { Virtuoso, VirtuosoHandle } from '@theia/core/shared/react-virtuoso';
+import { injectable, inject, postConstruct, named } from '@theia/core/shared/inversify';
 import { ReactWidget } from '@theia/core/lib/browser/widgets/react-widget';
 import { LabelProvider } from '@theia/core/lib/browser/label-provider';
 import { HoverService } from '@theia/core/lib/browser/hover-service';
@@ -30,15 +30,20 @@ import URI from '@theia/core/lib/common/uri';
 import { nls } from '@theia/core/lib/common/nls';
 import { CancellationTokenSource } from '@theia/core/lib/common/cancellation';
 import { DisposableCollection } from '@theia/core/lib/common/disposable';
+import { Emitter, Event } from '@theia/core/lib/common/event';
+import { DynamicToolbarWidget } from '@theia/core/lib/browser/view-container';
 import { MenuPath } from '@theia/core/lib/common/menu/menu-types';
 import { ContextMenuRenderer } from '@theia/core/lib/browser/context-menu-renderer';
 import { OpenerService, open } from '@theia/core/lib/browser/opener-service';
 import { DiffUris } from '@theia/core/lib/browser/diff-uris';
 import { ScmContextKeyService } from './scm-context-key-service';
+import { ScmPreferences } from '../common/scm-preferences';
 import {
-    laneColor, getChangeStatus, getFileName, getFilePath, getRepoRelativePath,
-    getRefBadgeClass, getRefBadgePresentation, isTagRef, isRemoteRef, deduplicateRefs, DeduplicatedRef
+    laneColor, filterRefsForBadges, getChangeStatus, getFileName, getFilePath, getRepoRelativePath,
+    getRefBadgeClass, getRefBadgePresentation, isTagRef, isRemoteRef, deduplicateRefs, DeduplicatedRef,
+    buildChangeTreeRows, ChangeTreeFolderRow
 } from './scm-history-graph-helpers';
+import { ILogger } from '@theia/core';
 import { buildHtmlTooltip, buildProviderTooltip } from './scm-history-graph-tooltip';
 
 /** Menu path matching the VS Code 'scm/history/title' contribution point (graph section toolbar). */
@@ -55,6 +60,19 @@ const ROW_HEIGHT = 22;
 const LANE_WIDTH = 22;
 /** Y position of the commit dot — vertically centered in the row. */
 const DOT_CY = 11;
+
+/** Indentation of one level of the change tree, in pixels. */
+const TREE_INDENT = 8;
+/** Shared empty set for history items whose change tree is fully expanded. */
+const EMPTY_FOLDER_SET: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Indentation for a row of the change tree. Like Theia's tree widget, the depth
+ * is applied as padding rather than through a class, as it is not known upfront.
+ */
+function indentStyle(depth: number): React.CSSProperties | undefined {
+    return depth > 0 ? { paddingLeft: `${4 + depth * TREE_INDENT}px` } : undefined;
+}
 
 /** Renders a ref badge as a JSX element for the commit row. */
 function renderJsxRefBadge(
@@ -82,7 +100,7 @@ function renderJsxRefBadge(
 // ── Widget ──────────────────────────────────────────────────────────────────
 
 @injectable()
-export class ScmHistoryGraphWidget extends ReactWidget {
+export class ScmHistoryGraphWidget extends ReactWidget implements DynamicToolbarWidget {
 
     static readonly ID = 'scm-history-graph-widget';
     static readonly LABEL = nls.localizeByDefault('Graph');
@@ -96,18 +114,30 @@ export class ScmHistoryGraphWidget extends ReactWidget {
     @inject(ContextMenuRenderer) protected readonly contextMenuRenderer: ContextMenuRenderer;
     @inject(OpenerService) protected readonly openerService: OpenerService;
     @inject(ScmContextKeyService) protected readonly scmContextKeys: ScmContextKeyService;
+    @inject(ScmPreferences) protected readonly scmPreferences: ScmPreferences;
+
+    @inject(ILogger) @named('scm:ScmHistoryGraphWidget')
+    protected readonly logger: ILogger;
 
     protected selectedIndex = -1;
+    /** Handle on the virtualized list, used to scroll an entry into view. */
+    protected readonly listRef = React.createRef<VirtuosoHandle>();
     /** Currently selected change row key (`${itemId}-${ci}`), or undefined. */
     protected selectedChangeKey: string | undefined;
     /** Map from commit id → loaded changes (undefined = not loaded yet). */
     protected expandedChanges = new Map<string, ScmHistoryItemChange[] | 'loading'>();
     /** Set of commit ids that are currently expanded. */
     protected expandedIds = new Set<string>();
+    /** Map from commit id → folder paths collapsed in its change tree. */
+    protected collapsedFolders = new Map<string, Set<string>>();
     /** Map from commit id → in-flight CancellationTokenSource for loadChanges. */
     protected loadChangesCts = new Map<string, CancellationTokenSource>();
     /** Cleanup for the content of the hover currently being shown. */
     protected readonly toDisposeOnHover = new DisposableCollection();
+
+    protected readonly onDidChangeToolbarItemsEmitter = new Emitter<void>();
+    /** Re-renders the part toolbar on model changes, e.g. to reflect the toggled state of the ref filter picker. */
+    readonly onDidChangeToolbarItems: Event<void> = this.onDidChangeToolbarItemsEmitter.event;
 
     constructor() {
         super();
@@ -121,10 +151,22 @@ export class ScmHistoryGraphWidget extends ReactWidget {
 
     @postConstruct()
     protected init(): void {
+        this.toDispose.push(this.onDidChangeToolbarItemsEmitter);
         this.toDispose.push(
             this.model.onDidChange(() => {
                 this.updateContextKeys();
                 this.update();
+                this.onDidChangeToolbarItemsEmitter.fire();
+            })
+        );
+        this.toDispose.push(
+            this.model.onDidRequestReveal(index => this.revealIndex(index))
+        );
+        this.toDispose.push(
+            this.scmPreferences.onPreferenceChanged(e => {
+                if (e.preferenceName.startsWith('scm.graph.')) {
+                    this.update();
+                }
             })
         );
         this.toDispose.push({
@@ -140,13 +182,20 @@ export class ScmHistoryGraphWidget extends ReactWidget {
         this.update();
     }
 
+    /** Scrolls the entry at `index` into view and selects it. */
+    protected revealIndex(index: number): void {
+        this.selectedIndex = index;
+        this.selectedChangeKey = undefined;
+        this.listRef.current?.scrollToIndex({ index, align: 'center' });
+        this.update();
+    }
+
     protected updateContextKeys(): void {
         const provider = this.model.provider;
         this.scmContextKeys.scmCurrentHistoryItemRefHasRemote.set(!!provider?.currentHistoryItemRemoteRef);
         this.scmContextKeys.scmCurrentHistoryItemRefHasBase.set(!!provider?.currentHistoryItemBaseRef);
-        // The graph has no ref filter yet, so the current ref is always considered part of it.
         // Commands like git.pullRef/git.pushRef gate their enablement on this key.
-        this.scmContextKeys.scmCurrentHistoryItemRefInFilter.set(!!provider?.currentHistoryItemRef);
+        this.scmContextKeys.scmCurrentHistoryItemRefInFilter.set(!!provider?.currentHistoryItemRef && this.model.isCurrentRefInFilter());
     }
 
     protected render(): React.ReactNode {
@@ -195,10 +244,11 @@ export class ScmHistoryGraphWidget extends ReactWidget {
 
         return (
             <Virtuoso
+                ref={this.listRef}
                 className='scm-history-graph-list'
                 data={entries as HistoryGraphEntry[]}
                 itemContent={(idx, entry) => this.renderRow(entry, idx, svgWidth)}
-                endReached={hasMore && !loading ? this.handleEndReached : undefined}
+                endReached={hasMore && !loading && this.scmPreferences['scm.graph.pageOnScroll'] !== false ? this.handleEndReached : undefined}
                 overscan={500}
                 components={footer ? { Footer: footer } : {}}
                 style={{ overflowX: 'hidden' }}
@@ -317,6 +367,18 @@ export class ScmHistoryGraphWidget extends ReactWidget {
             );
         }
 
+        if (this.model.viewMode === 'tree') {
+            const rootUri = this.scmService.selectedRepository?.provider.rootUri;
+            const rows = buildChangeTreeRows(changes, rootUri, this.collapsedFolders.get(itemId) ?? EMPTY_FOLDER_SET);
+            return (
+                <React.Fragment key={`${itemId}-changes`}>
+                    {rows.map(row => row.type === 'folder'
+                        ? this.renderChangeFolderRow(row, itemId, svgWidth, graphRow)
+                        : this.renderChangeRow(row.change, row.index, itemId, svgWidth, graphRow, row.depth))}
+                </React.Fragment>
+            );
+        }
+
         return (
             <React.Fragment key={`${itemId}-changes`}>
                 {changes.map((change, ci) =>
@@ -326,18 +388,66 @@ export class ScmHistoryGraphWidget extends ReactWidget {
         );
     }
 
+    protected renderChangeFolderRow(
+        row: ChangeTreeFolderRow,
+        itemId: string,
+        svgWidth: number,
+        graphRow: GraphRow
+    ): React.ReactElement {
+        const collapsed = this.isFolderCollapsed(itemId, row.path);
+        return (
+            <div
+                key={`${itemId}-folder-${row.path}`}
+                className='scm-history-change-row scm-history-change-folder-row'
+                onClick={e => this.handleFolderClick(e, itemId, row.path)}
+                role='treeitem'
+                aria-expanded={!collapsed}
+                tabIndex={-1}
+            >
+                {this.renderChangeRowSvg(graphRow, svgWidth)}
+                <div className='scm-history-change-info' style={indentStyle(row.depth)}>
+                    <span className={`codicon ${collapsed ? 'codicon-chevron-right' : 'codicon-chevron-down'} scm-history-change-twistie`} />
+                    <span className='name scm-history-change-name' title={row.path}>{row.label}</span>
+                </div>
+            </div>
+        );
+    }
+
+    protected isFolderCollapsed(itemId: string, path: string): boolean {
+        return !!this.collapsedFolders.get(itemId)?.has(path);
+    }
+
+    protected toggleFolder(itemId: string, path: string): void {
+        let collapsed = this.collapsedFolders.get(itemId);
+        if (!collapsed) {
+            collapsed = new Set<string>();
+            this.collapsedFolders.set(itemId, collapsed);
+        }
+        if (!collapsed.delete(path)) {
+            collapsed.add(path);
+        }
+        this.update();
+    }
+
+    protected handleFolderClick = (e: React.MouseEvent, itemId: string, path: string): void => {
+        e.stopPropagation();
+        this.toggleFolder(itemId, path);
+    };
+
     protected renderChangeRow(
         change: ScmHistoryItemChange,
         ci: number,
         itemId: string,
         svgWidth: number,
-        graphRow: GraphRow
+        graphRow: GraphRow,
+        depth = 0
     ): React.ReactElement {
         const rootUri = this.scmService.selectedRepository?.provider.rootUri;
         const uri = change.modifiedUri ?? change.originalUri ?? change.uri;
         const relativePath = getRepoRelativePath(uri, rootUri);
         const fileName = getFileName(relativePath);
-        const dirPath = relativePath.includes('/')
+        // In tree mode the folder rows already carry the directory.
+        const dirPath = this.model.viewMode === 'list' && relativePath.includes('/')
             ? relativePath.slice(0, relativePath.lastIndexOf('/'))
             : '';
         const status = getChangeStatus(change);
@@ -356,7 +466,7 @@ export class ScmHistoryGraphWidget extends ReactWidget {
                 tabIndex={-1}
             >
                 {this.renderChangeRowSvg(graphRow, svgWidth)}
-                <div className='scm-history-change-info'>
+                <div className='scm-history-change-info' style={indentStyle(depth)}>
                     <span className={`${fileIcon} file-icon scm-history-change-file-icon`} />
                     <div className='scm-history-change-name-container'>
                         <span className='name scm-history-change-name' title={relativePath}>{fileName}</span>
@@ -390,7 +500,7 @@ export class ScmHistoryGraphWidget extends ReactWidget {
                 open(this.openerService, new URI(change.uri));
             }
         } catch (err) {
-            console.error('ScmHistoryGraphWidget: failed to open change', err);
+            this.logger.error('Failed to open change', err);
         }
     }
 
@@ -606,8 +716,12 @@ export class ScmHistoryGraphWidget extends ReactWidget {
         }
 
         const provider = this.model.provider;
+        const visibleRefs = filterRefsForBadges(refs, provider, this.scmPreferences['scm.graph.badges'] ?? 'filter', this.model.historyItemRefFilter);
+        if (visibleRefs.length === 0) {
+            return undefined;
+        }
         const laneColorValue = entry ? laneColor(entry.graphRow.color) : undefined;
-        const deduplicated = deduplicateRefs(refs);
+        const deduplicated = deduplicateRefs(visibleRefs);
         const badgeForeground = 'var(--theia-scmGraph-historyItemRefForeground, var(--theia-badge-foreground))';
 
         const badges: React.ReactElement[] = [];
@@ -695,6 +809,7 @@ export class ScmHistoryGraphWidget extends ReactWidget {
 
         if (this.expandedIds.has(item.id)) {
             this.expandedIds.delete(item.id);
+            this.collapsedFolders.delete(item.id);
             const cts = this.loadChangesCts.get(item.id);
             if (cts) {
                 cts.cancel();
@@ -735,7 +850,7 @@ export class ScmHistoryGraphWidget extends ReactWidget {
             }
         } catch (err) {
             if (!cts.token.isCancellationRequested) {
-                console.error('ScmHistoryGraphWidget: failed to load changes', err);
+                this.logger.error('Failed to load changes', err);
                 this.expandedChanges.set(item.id, []);
                 this.update();
             }
