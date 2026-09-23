@@ -30,10 +30,10 @@ import * as React from '@theia/core/shared/react';
 import { flushSync } from '@theia/core/shared/react-dom';
 import { createRoot } from '@theia/core/shared/react-dom/client';
 import { AiConfigurationItemRow } from './ai-configuration-item-row';
-import { AiConfigurationEmptyState, AiConfigurationItemDetailHeader, AiConfigurationSection } from './ai-configuration-primitives';
+import { AiConfigurationCallout, AiConfigurationEmptyState, AiConfigurationItemDetailHeader, AiConfigurationSection } from './ai-configuration-primitives';
 import { AiConfigurationOrigin, AiConfigurationOriginBadge, AiConfigurationOriginBadges } from './ai-configuration-origin-badge';
 import { AiConfigurationSettingRow } from './ai-configuration-setting-row';
-import { AiArrayInput, AiNumberStepper } from './ai-configuration-controls';
+import { AiArrayInput, AiEnumSelect, AiNumberStepper } from './ai-configuration-controls';
 import { ConfirmDialog } from '@theia/core/lib/browser';
 import { PromptCustomizationDialogs } from './prompt-customization-dialogs';
 import { VariantSetCard } from './variant-set-card';
@@ -113,6 +113,39 @@ describe('AI Configuration primitives', () => {
         flushSync(() => root.render(element));
         return { container, dispose: () => { flushSync(() => root.unmount()); container.remove(); } };
     }
+
+    it('AiConfigurationCallout keeps a long message inside the box and repeats it on hover', () => {
+        // A provider's failure ends up here verbatim, keys and URLs included, with nothing to wrap at.
+        const message = '401 Incorrect API key provided: sk-proj-' + 'x'.repeat(120) + '. See https://platform.openai.com/account/api-keys.';
+        const { container, dispose } = mount(React.createElement(AiConfigurationCallout, {
+            message,
+            action: React.createElement('button', {}, 'Retry')
+        }));
+        try {
+            const text = container.querySelector<HTMLElement>('.ai-configuration-callout-text')!;
+            expect(text.title).to.equal(message);
+            // The action stays a sibling of the text rather than being pushed out of the row.
+            expect(container.querySelector('.ai-configuration-callout button')?.textContent).to.equal('Retry');
+        } finally {
+            dispose();
+        }
+    });
+
+    it('AiEnumSelect passes a separator on as one, not as a selectable option', () => {
+        // A separator that loses its flag on the way to SelectComponent becomes a selectable entry with
+        // no label, and picking it commits the empty value. The field skipping it is what says it did not.
+        const { container, dispose } = mount(React.createElement(AiEnumSelect, {
+            value: undefined,
+            options: [{ value: '', label: '', separator: true }, { value: 'a', label: 'A' }],
+            ariaLabel: 'Model',
+            onCommit: () => { }
+        }));
+        try {
+            expect(container.querySelector('.theia-select-component-label')?.textContent).to.equal('A');
+        } finally {
+            dispose();
+        }
+    });
 
     it('AiConfigurationSection renders its title and children', () => {
         const { container, dispose } = mount(React.createElement(AiConfigurationSection,
@@ -201,6 +234,64 @@ describe('AI Configuration primitives', () => {
         expect(opened[0]).to.equal(gear);
         root.unmount();
         host.remove();
+    });
+
+    /**
+     * JSDOM lays nothing out, so every element reports a zero height and a description would never measure as
+     * clamped. Fakes the two heights the row compares, which is exactly the browser's "the text does not fit"
+     * signal, and restores them afterwards.
+     */
+    function withClampedText(scrollHeight: number, run: () => void): void {
+        // Both live on `Element.prototype`, which is where JSDOM defines them.
+        const prototype = document.defaultView!.Element.prototype;
+        const original = {
+            scrollHeight: Object.getOwnPropertyDescriptor(prototype, 'scrollHeight')!,
+            clientHeight: Object.getOwnPropertyDescriptor(prototype, 'clientHeight')!
+        };
+        Object.defineProperty(prototype, 'scrollHeight', { configurable: true, get: () => scrollHeight });
+        Object.defineProperty(prototype, 'clientHeight', { configurable: true, get: () => 40 });
+        try {
+            run();
+        } finally {
+            Object.defineProperty(prototype, 'scrollHeight', original.scrollHeight);
+            Object.defineProperty(prototype, 'clientHeight', original.clientHeight);
+        }
+    }
+
+    it('AiConfigurationItemRow expands a description that does not fit, and leaves a fitting one alone', () => {
+        // A tool description running past the two-line clamp is otherwise unreadable in the list.
+        withClampedText(120, () => {
+            let rowOpened = 0;
+            const { container, dispose } = mount(React.createElement(AiConfigurationItemRow, {
+                label: 'writeFileReplacements',
+                description: 'Replace text in a file. The old text must be unique in the file.',
+                onSelect: () => { rowOpened++; }
+            }));
+            try {
+                const description = container.querySelector('.ai-configuration-item-row-description') as HTMLElement;
+                expect(description.classList.contains('expanded')).to.equal(false);
+                const toggle = container.querySelector('.ai-configuration-item-row-description-toggle') as HTMLButtonElement;
+                expect(Boolean(toggle)).to.equal(true);
+                expect(toggle.getAttribute('aria-expanded')).to.equal('false');
+
+                flushSync(() => toggle.click());
+                expect(description.classList.contains('expanded')).to.equal(true);
+                expect(container.querySelector('.ai-configuration-item-row-description-toggle')!.getAttribute('aria-expanded')).to.equal('true');
+                // Reading the description must not also open the row's detail page.
+                expect(rowOpened).to.equal(0);
+            } finally {
+                dispose();
+            }
+        });
+        // Nothing hidden, so no toggle to offer.
+        withClampedText(40, () => {
+            const { container, dispose } = mount(React.createElement(AiConfigurationItemRow, { label: 'readFile', description: 'Read a file.' }));
+            try {
+                expect(Boolean(container.querySelector('.ai-configuration-item-row-description-toggle'))).to.equal(false);
+            } finally {
+                dispose();
+            }
+        });
     });
 
     it('AiConfigurationEmptyState renders the message and an optional action', async () => {
@@ -510,7 +601,7 @@ describe('VariantSetCard', () => {
         const originalOpen = ConfirmDialog.prototype.open;
         ConfirmDialog.prototype.open = async () => true;
         try {
-            const remove = container.querySelector<HTMLButtonElement>('.ai-variant-action-button:last-of-type');
+            const remove = container.querySelector<HTMLButtonElement>('.ai-configuration-icon-button:last-of-type');
             remove!.click();
             // Let the confirmation and both service calls settle.
             await new Promise(resolve => setTimeout(resolve, 0));
